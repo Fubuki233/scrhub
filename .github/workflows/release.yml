@@ -1,0 +1,185 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      scrcpy_version:
+        description: 'scrcpy version to bundle (e.g. v3.3.4, or "latest")'
+        required: false
+        default: 'latest'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: linux-x86_64
+            ext: ''
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            suffix: windows-x86_64
+            ext: '.exe'
+            archive: zip
+          - goos: darwin
+            goarch: amd64
+            suffix: macos-x86_64
+            ext: ''
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            suffix: macos-aarch64
+            ext: ''
+            archive: tar.gz
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Resolve scrcpy version
+        id: scrcpy
+        run: |
+          INPUT_VER="${{ github.event.inputs.scrcpy_version }}"
+          if [ -z "$INPUT_VER" ] || [ "$INPUT_VER" = "latest" ]; then
+            SCRCPY_VER=$(curl -sL https://api.github.com/repos/Genymobile/scrcpy/releases/latest | grep '"tag_name"' | sed 's/.*"tag_name": "\(.*\)".*/\1/')
+          else
+            SCRCPY_VER="$INPUT_VER"
+          fi
+          echo "version=$SCRCPY_VER" >> "$GITHUB_OUTPUT"
+          echo "Resolved scrcpy version: $SCRCPY_VER"
+
+      - name: Download scrcpy-server
+        run: |
+          SCRCPY_VER="${{ steps.scrcpy.outputs.version }}"
+          mkdir -p bundle
+          curl -sL "https://github.com/Genymobile/scrcpy/releases/download/${SCRCPY_VER}/scrcpy-server-${SCRCPY_VER}" -o bundle/scrcpy-server
+          echo "Downloaded scrcpy-server ${SCRCPY_VER} ($(wc -c < bundle/scrcpy-server) bytes)"
+
+      - name: Download ADB
+        run: |
+          mkdir -p bundle
+          case "${{ matrix.goos }}" in
+            linux)
+              curl -sL https://dl.google.com/android/repository/platform-tools-latest-linux.zip -o /tmp/pt.zip
+              unzip -q /tmp/pt.zip -d /tmp/pt
+              cp /tmp/pt/platform-tools/adb bundle/adb
+              chmod +x bundle/adb
+              ;;
+            windows)
+              curl -sL https://dl.google.com/android/repository/platform-tools-latest-windows.zip -o /tmp/pt.zip
+              unzip -q /tmp/pt.zip -d /tmp/pt
+              cp /tmp/pt/platform-tools/adb.exe bundle/adb.exe
+              cp /tmp/pt/platform-tools/AdbWinApi.dll bundle/AdbWinApi.dll
+              cp /tmp/pt/platform-tools/AdbWinUsbApi.dll bundle/AdbWinUsbApi.dll
+              ;;
+            darwin)
+              curl -sL https://dl.google.com/android/repository/platform-tools-latest-darwin.zip -o /tmp/pt.zip
+              unzip -q /tmp/pt.zip -d /tmp/pt
+              cp /tmp/pt/platform-tools/adb bundle/adb
+              chmod +x bundle/adb
+              ;;
+          esac
+
+      - name: Build Go binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          go build -trimpath -ldflags="-s -w" -o "bundle/scrhub${{ matrix.ext }}" ./cmd/web-scrcpy/
+
+      - name: Package release
+        id: package
+        run: |
+          SCRCPY_VER="${{ steps.scrcpy.outputs.version }}"
+          REF_NAME="${GITHUB_REF_NAME:-dev}"
+          ARCHIVE_NAME="scrhub-${REF_NAME}-${{ matrix.suffix }}"
+          cd bundle
+          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
+            tar czf "../${ARCHIVE_NAME}.tar.gz" .
+            echo "file=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          else
+            zip -q "../${ARCHIVE_NAME}.zip" ./*
+            echo "file=${ARCHIVE_NAME}.zip" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Packaged: ${ARCHIVE_NAME}"
+          ls -lh ../${ARCHIVE_NAME}.*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrhub-${{ matrix.suffix }}
+          path: ${{ steps.package.outputs.file }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Resolve scrcpy version
+        id: scrcpy
+        run: |
+          INPUT_VER="${{ github.event.inputs.scrcpy_version }}"
+          if [ -z "$INPUT_VER" ] || [ "$INPUT_VER" = "latest" ]; then
+            SCRCPY_VER=$(curl -sL https://api.github.com/repos/Genymobile/scrcpy/releases/latest | grep '"tag_name"' | sed 's/.*"tag_name": "\(.*\)".*/\1/')
+          else
+            SCRCPY_VER="$INPUT_VER"
+          fi
+          echo "version=$SCRCPY_VER" >> "$GITHUB_OUTPUT"
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "scrhub ${{ github.ref_name }} (scrcpy ${{ steps.scrcpy.outputs.version }})"
+          body: |
+            ## scrhub ${{ github.ref_name }}
+
+            Web-based scrcpy relay server. Bundled with:
+            - **scrcpy-server**: ${{ steps.scrcpy.outputs.version }}
+            - **ADB**: latest from Google platform-tools
+
+            ### Platforms
+            | Platform | File |
+            |----------|------|
+            | Linux x86_64 | `scrhub-${{ github.ref_name }}-linux-x86_64.tar.gz` |
+            | Windows x86_64 | `scrhub-${{ github.ref_name }}-windows-x86_64.zip` |
+            | macOS x86_64 | `scrhub-${{ github.ref_name }}-macos-x86_64.tar.gz` |
+            | macOS aarch64 | `scrhub-${{ github.ref_name }}-macos-aarch64.tar.gz` |
+
+            ### Usage
+            ```bash
+            # Extract and run
+            tar xzf scrhub-${{ github.ref_name }}-linux-x86_64.tar.gz
+            ./scrhub --listen :8080
+            ```
+          files: |
+            artifacts/*
+          draft: false
+          prerelease: false

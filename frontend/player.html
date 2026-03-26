@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Web scrcpy - Player</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <div class="player-container">
+        <div id="connection-overlay" class="connection-overlay">
+            Connecting to device...
+        </div>
+
+        <div class="player-canvas-wrapper">
+            <canvas id="player-canvas"></canvas>
+            <video id="player-video" autoplay muted playsinline></video>
+            <div id="play-overlay" class="play-overlay hidden" title="Click to play">▶</div>
+        </div>
+
+        <div class="control-bar">
+            <button id="btn-back" class="btn btn-control" title="Back">← Back</button>
+            <button id="btn-home" class="btn btn-control" title="Home">⊙ Home</button>
+            <button id="btn-recents" class="btn btn-control" title="Recent Apps">☰ Recents</button>
+            <div class="spacer"></div>
+            <span id="viewer-count" class="viewers">Viewers: -</span>
+            <button id="btn-request-control" class="btn btn-control">Request Control</button>
+            <button id="btn-audio" class="btn btn-audio muted" title="Toggle Audio">🔇</button>
+            <button id="btn-settings" class="btn btn-settings" title="Quality Settings">⚙</button>
+            <button id="btn-fullscreen" class="btn btn-fullscreen" title="Fullscreen">⛶</button>
+            <button id="btn-debug" class="btn" title="Toggle Debug">🐛</button>
+        </div>
+
+        <!-- Settings Panel -->
+        <div id="settings-panel" class="settings-panel hidden">
+            <h3>Quality Settings</h3>
+            <div class="setting-group">
+                <label for="setting-resolution">Resolution</label>
+                <select id="setting-resolution">
+                    <option value="0">Native (Original)</option>
+                    <option value="2560">2560p</option>
+                    <option value="1920">1920p</option>
+                    <option value="1440">1440p</option>
+                    <option value="1080" selected>1080p</option>
+                    <option value="720">720p</option>
+                    <option value="480">480p</option>
+                </select>
+            </div>
+            <div class="setting-group">
+                <label for="setting-fps">Frame Rate</label>
+                <select id="setting-fps">
+                    <option value="120">120 FPS</option>
+                    <option value="90">90 FPS</option>
+                    <option value="60" selected>60 FPS</option>
+                    <option value="30">30 FPS</option>
+                </select>
+            </div>
+            <div class="setting-group">
+                <label for="setting-bitrate">Bitrate: <span id="bitrate-label">8 Mbps</span></label>
+                <input type="range" id="setting-bitrate" min="1" max="50" value="8" step="1">
+            </div>
+            <div class="setting-group auto-group">
+                <label><input type="checkbox" id="setting-auto"> Auto Adaptive</label>
+                <span id="auto-status" class="auto-status"></span>
+            </div>
+            <div class="setting-actions">
+                <button class="btn btn-apply" id="btn-apply-settings">Apply & Reconnect</button>
+            </div>
+            <div class="setting-info">
+                <span id="quality-indicator" class="quality-dot green"></span>
+                <span id="quality-text">Good</span>
+                <span id="current-settings-text" class="current-settings"></span>
+            </div>
+        </div>
+
+        <div id="debug-panel" class="debug-panel">
+            <pre id="debug-stats">Loading...</pre>
+        </div>
+    </div>
+
+    <script type="module">
+        import { ScrcpyClient } from '/js/websocket.js';
+        import { VideoDecoder2 } from '/js/decoder.js';
+        import { MSEDecoder } from '/js/mse-decoder.js';
+        import { AudioPlayer } from '/js/audio.js';
+        import { InputHandler } from '/js/input.js';
+        import {
+            AKEY_ACTION_DOWN, AKEY_ACTION_UP,
+            serializeInjectKeycode, serializeBackOrScreenOn,
+        } from '/js/protocol.js';
+
+        // Parse serial from URL
+        const params = new URLSearchParams(window.location.search);
+        const serial = params.get('serial');
+        if (!serial) {
+            document.getElementById('connection-overlay').textContent = 'No device serial provided';
+            throw new Error('No serial');
+        }
+
+        document.title = `Web scrcpy - ${serial}`;
+
+        // UI elements
+        const canvas = document.getElementById('player-canvas');
+        const videoEl = document.getElementById('player-video');
+        const overlay = document.getElementById('connection-overlay');
+        const viewerCountEl = document.getElementById('viewer-count');
+        const btnRequestControl = document.getElementById('btn-request-control');
+        const btnAudio = document.getElementById('btn-audio');
+        const btnFullscreen = document.getElementById('btn-fullscreen');
+        const btnBack = document.getElementById('btn-back');
+        const btnHome = document.getElementById('btn-home');
+        const btnRecents = document.getElementById('btn-recents');
+        const btnSettings = document.getElementById('btn-settings');
+        const settingsPanel = document.getElementById('settings-panel');
+        const btnApplySettings = document.getElementById('btn-apply-settings');
+
+        // Settings elements
+        const settingResolution = document.getElementById('setting-resolution');
+        const settingFPS = document.getElementById('setting-fps');
+        const settingBitrate = document.getElementById('setting-bitrate');
+        const bitrateLabel = document.getElementById('bitrate-label');
+        const settingAuto = document.getElementById('setting-auto');
+        const autoStatus = document.getElementById('auto-status');
+        const qualityIndicator = document.getElementById('quality-indicator');
+        const qualityText = document.getElementById('quality-text');
+        const currentSettingsText = document.getElementById('current-settings-text');
+
+        // Choose decoder: WebCodecs (canvas) or MSE (<video>) fallback
+        // WebCodecs requires secure context (HTTPS or localhost). Even if
+        // window.VideoDecoder exists, it won't work over plain HTTP on LAN IPs.
+        const isSecureContext = window.isSecureContext;
+        const hasWebCodecs = isSecureContext && typeof window.VideoDecoder !== 'undefined';
+        let videoDecoder;
+        let inputTarget;
+        let usingMSE = !hasWebCodecs;
+
+        if (hasWebCodecs) {
+            videoDecoder = new VideoDecoder2(canvas);
+            canvas.style.display = 'block';
+            videoEl.style.display = 'none';
+            inputTarget = canvas;
+        } else {
+            videoDecoder = new MSEDecoder(videoEl);
+            canvas.style.display = 'none';
+            videoEl.style.display = 'block';
+            inputTarget = videoEl;
+
+            // Show play overlay if autoplay is blocked (non-localhost)
+            const playOverlay = document.getElementById('play-overlay');
+            videoDecoder.onPlayBlocked = () => {
+                playOverlay.classList.remove('hidden');
+            };
+            playOverlay.addEventListener('click', () => {
+                videoDecoder.tryPlay();
+                playOverlay.classList.add('hidden');
+            });
+            // Also resume on any click/touch on the video element
+            videoEl.addEventListener('click', () => {
+                if (videoEl.paused) {
+                    videoDecoder.tryPlay();
+                    playOverlay.classList.add('hidden');
+                }
+            });
+        }
+
+        // State
+        let hasControl = false;
+        let deviceWidth = 0;
+        let deviceHeight = 0;
+
+        // Current session settings (loaded from server)
+        let currentSettings = {
+            max_size: 0,
+            bit_rate: 8000000,
+            max_fps: '60',
+        };
+
+        // Debug / perf stats
+        const stats = {
+            wsState: 'disconnected',
+            videoPkts: 0,
+            audioPkts: 0,
+            mgmtMsgs: 0,
+            videoBytes: 0,
+            decoderState: 'none',
+            decoderCodec: '',
+            decoderFrames: 0,
+            decoderErrors: [],
+            lastError: '',
+            decoderMode: hasWebCodecs ? 'WebCodecs' : 'MSE (non-secure ctx)',
+        };
+
+        // ==== Auto-adaptive state ====
+        let autoAdaptive = false;
+        let adaptiveHistory = []; // {ts, frames} samples
+        let lastAdaptiveFrames = 0;
+        let adaptiveBadCount = 0;
+        let adaptiveGoodCount = 0;
+        let adaptiveReconnecting = false;
+
+        // ==== Initialize components ====
+        const client = new ScrcpyClient(serial);
+        const audioPlayer = new AudioPlayer();
+        const inputHandler = new InputHandler(
+            inputTarget,
+            (data) => client.sendControl(data),
+            () => ({ width: deviceWidth, height: deviceHeight })
+        );
+
+        // Load server defaults and populate settings panel
+        async function loadDefaults() {
+            try {
+                const resp = await fetch('/api/defaults');
+                if (resp.ok) {
+                    const defaults = await resp.json();
+                    currentSettings = defaults;
+                    applySettingsToUI(defaults);
+                }
+            } catch (e) { /* ignore */ }
+        }
+
+        function applySettingsToUI(s) {
+            settingResolution.value = String(s.max_size || 0);
+            settingFPS.value = String(s.max_fps || '60');
+            const mbps = Math.round((s.bit_rate || 8000000) / 1000000);
+            settingBitrate.value = mbps;
+            bitrateLabel.textContent = mbps + ' Mbps';
+            updateCurrentSettingsDisplay();
+        }
+
+        function getSettingsFromUI() {
+            return {
+                max_size: parseInt(settingResolution.value),
+                bit_rate: parseInt(settingBitrate.value) * 1000000,
+                max_fps: settingFPS.value,
+            };
+        }
+
+        function updateCurrentSettingsDisplay() {
+            const res = currentSettings.max_size === 0 ? 'Native' : currentSettings.max_size + 'p';
+            const mbps = Math.round(currentSettings.bit_rate / 1000000);
+            currentSettingsText.textContent = `Current: ${res} / ${currentSettings.max_fps}fps / ${mbps}Mbps`;
+        }
+
+        // ==== Settings panel ====
+        settingBitrate.addEventListener('input', () => {
+            bitrateLabel.textContent = settingBitrate.value + ' Mbps';
+        });
+
+        btnSettings.addEventListener('click', () => {
+            settingsPanel.classList.toggle('hidden');
+        });
+
+        btnApplySettings.addEventListener('click', async () => {
+            const newSettings = getSettingsFromUI();
+            await reconnectWithSettings(newSettings);
+        });
+
+        settingAuto.addEventListener('change', () => {
+            autoAdaptive = settingAuto.checked;
+            adaptiveBadCount = 0;
+            adaptiveGoodCount = 0;
+            adaptiveHistory = [];
+            autoStatus.textContent = autoAdaptive ? 'Monitoring...' : '';
+        });
+
+        // ==== Reconnect with new settings ====
+        async function reconnectWithSettings(newSettings) {
+            overlay.textContent = 'Applying new settings...';
+            overlay.classList.remove('hidden');
+            btnApplySettings.disabled = true;
+            btnApplySettings.textContent = 'Reconnecting...';
+
+            try {
+                // 1. Disconnect current session
+                client.disconnect();
+                await fetch(`/api/devices/${encodeURIComponent(serial)}/disconnect`, { method: 'POST' });
+
+                // 2. Small delay for cleanup
+                await new Promise(r => setTimeout(r, 500));
+
+                // 3. Connect with new settings
+                const resp = await fetch(`/api/devices/${encodeURIComponent(serial)}/connect`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(newSettings),
+                });
+
+                if (!resp.ok) {
+                    const err = await resp.text();
+                    throw new Error(err);
+                }
+
+                const result = await resp.json();
+                currentSettings = newSettings;
+                updateCurrentSettingsDisplay();
+
+                // 4. Reset decoder state
+                if (usingMSE) {
+                    videoDecoder.destroy();
+                    videoDecoder = new MSEDecoder(videoEl);
+                    videoDecoder.onPlayBlocked = () => {
+                        document.getElementById('play-overlay').classList.remove('hidden');
+                    };
+                } else {
+                    videoDecoder = new VideoDecoder2(canvas);
+                }
+                stats.videoPkts = 0;
+                stats.videoBytes = 0;
+                stats.decoderFrames = 0;
+                lastAdaptiveFrames = 0;
+                adaptiveHistory = [];
+
+                // 5. Reconnect WebSocket
+                client.reconnect();
+
+            } catch (e) {
+                overlay.textContent = 'Reconnect failed: ' + e.message;
+                // Try to auto-recover
+                setTimeout(() => {
+                    client.shouldReconnect = true;
+                    client.connect();
+                }, 2000);
+            } finally {
+                btnApplySettings.disabled = false;
+                btnApplySettings.textContent = 'Apply & Reconnect';
+            }
+        }
+
+        // ==== Client callbacks ====
+        client.onConnected = () => {
+            overlay.classList.add('hidden');
+            stats.wsState = 'connected';
+            client.requestControl();
+        };
+
+        client.onDisconnected = () => {
+            overlay.textContent = 'Disconnected. Reconnecting...';
+            overlay.classList.remove('hidden');
+            inputHandler.disable();
+            hasControl = false;
+            stats.wsState = 'disconnected';
+            updateControlButton();
+        };
+
+        client.onMgmtMsg = (msg) => {
+            stats.mgmtMsgs++;
+            switch (msg.type) {
+                case 'device_info':
+                    deviceWidth = msg.width;
+                    deviceHeight = msg.height;
+                    stats.decoderCodec = msg.video_codec;
+                    videoDecoder.init(msg.video_codec, msg.width, msg.height);
+                    audioPlayer.init(msg.audio_codec);
+                    updateCanvasSize();
+                    break;
+
+                case 'control_granted':
+                    hasControl = msg.granted;
+                    if (hasControl) {
+                        inputHandler.enable();
+                    }
+                    updateControlButton();
+                    break;
+
+                case 'control_released':
+                    hasControl = false;
+                    inputHandler.disable();
+                    updateControlButton();
+                    break;
+
+                case 'viewer_count':
+                    viewerCountEl.textContent = `Viewers: ${msg.count}`;
+                    break;
+            }
+        };
+
+        client.onVideoData = (packet) => {
+            stats.videoPkts++;
+            stats.videoBytes += packet.length;
+            try {
+                videoDecoder.feed(packet);
+            } catch (e) {
+                stats.lastError = 'video feed: ' + e.message;
+            }
+            stats.decoderState = videoDecoder.decoder ? videoDecoder.decoder.state : 'null';
+            stats.decoderFrames = videoDecoder.frameCount;
+        };
+
+        client.onAudioData = (packet) => {
+            stats.audioPkts++;
+            audioPlayer.feed(packet);
+        };
+
+        // ==== Button handlers ====
+        btnRequestControl.addEventListener('click', () => {
+            if (hasControl) {
+                client.releaseControl();
+                hasControl = false;
+                inputHandler.disable();
+                updateControlButton();
+            } else {
+                client.requestControl();
+            }
+        });
+
+        btnAudio.addEventListener('click', () => {
+            const muted = !audioPlayer.muted;
+            audioPlayer.setMuted(muted);
+            btnAudio.textContent = muted ? '🔇' : '🔊';
+            btnAudio.classList.toggle('muted', muted);
+        });
+
+        btnFullscreen.addEventListener('click', () => {
+            const container = document.querySelector('.player-container');
+            if (document.fullscreenElement) {
+                document.exitFullscreen();
+            } else {
+                container.requestFullscreen();
+            }
+        });
+
+        // Android navigation buttons
+        btnBack.addEventListener('click', () => {
+            if (!hasControl) return;
+            client.sendControl(serializeBackOrScreenOn(AKEY_ACTION_DOWN));
+            setTimeout(() => {
+                client.sendControl(serializeBackOrScreenOn(AKEY_ACTION_UP));
+            }, 50);
+        });
+
+        btnHome.addEventListener('click', () => {
+            if (!hasControl) return;
+            client.sendControl(serializeInjectKeycode(AKEY_ACTION_DOWN, 3, 0, 0));
+            setTimeout(() => {
+                client.sendControl(serializeInjectKeycode(AKEY_ACTION_UP, 3, 0, 0));
+            }, 50);
+        });
+
+        btnRecents.addEventListener('click', () => {
+            if (!hasControl) return;
+            client.sendControl(serializeInjectKeycode(AKEY_ACTION_DOWN, 187, 0, 0));
+            setTimeout(() => {
+                client.sendControl(serializeInjectKeycode(AKEY_ACTION_UP, 187, 0, 0));
+            }, 50);
+        });
+
+        function updateControlButton() {
+            if (hasControl) {
+                btnRequestControl.textContent = 'Release Control';
+                btnRequestControl.classList.add('active');
+            } else {
+                btnRequestControl.textContent = 'Request Control';
+                btnRequestControl.classList.remove('active');
+            }
+        }
+
+        function updateCanvasSize() {
+            if (!deviceWidth || !deviceHeight) return;
+            const wrapper = document.querySelector('.player-canvas-wrapper');
+            const wrapperRect = wrapper.getBoundingClientRect();
+            const aspect = deviceWidth / deviceHeight;
+            let w, h;
+            if (wrapperRect.width / wrapperRect.height > aspect) {
+                h = wrapperRect.height;
+                w = h * aspect;
+            } else {
+                w = wrapperRect.width;
+                h = w / aspect;
+            }
+            if (hasWebCodecs) {
+                canvas.style.width = w + 'px';
+                canvas.style.height = h + 'px';
+            } else {
+                videoEl.style.width = w + 'px';
+                videoEl.style.height = h + 'px';
+            }
+        }
+
+        window.addEventListener('resize', updateCanvasSize);
+
+        // ==== Auto-Adaptive Quality ====
+        // Samples frame count every 2 seconds, detects quality degradation
+        const ADAPTIVE_INTERVAL = 2000;
+        const ADAPTIVE_BAD_THRESHOLD = 3;  // consecutive bad samples to trigger downgrade
+        const ADAPTIVE_GOOD_THRESHOLD = 5; // consecutive good samples to try upgrade
+
+        setInterval(() => {
+            if (!autoAdaptive || adaptiveReconnecting) return;
+            if (stats.wsState !== 'connected') return;
+
+            const currentFrames = stats.decoderFrames;
+            const delta = currentFrames - lastAdaptiveFrames;
+            lastAdaptiveFrames = currentFrames;
+
+            const targetFPS = parseInt(currentSettings.max_fps) || 60;
+            const expectedFrames = targetFPS * (ADAPTIVE_INTERVAL / 1000);
+            const efficiency = expectedFrames > 0 ? delta / expectedFrames : 1;
+
+            adaptiveHistory.push({ efficiency, ts: Date.now() });
+            if (adaptiveHistory.length > 30) adaptiveHistory.shift();
+
+            if (efficiency < 0.5) {
+                adaptiveBadCount++;
+                adaptiveGoodCount = 0;
+                setQualityIndicator('red', `Poor (${Math.round(efficiency * 100)}%)`);
+            } else if (efficiency < 0.8) {
+                adaptiveBadCount++;
+                adaptiveGoodCount = 0;
+                setQualityIndicator('yellow', `Fair (${Math.round(efficiency * 100)}%)`);
+            } else {
+                adaptiveBadCount = 0;
+                adaptiveGoodCount++;
+                setQualityIndicator('green', `Good (${Math.round(efficiency * 100)}%)`);
+            }
+
+            autoStatus.textContent = `${delta}/${Math.round(expectedFrames)} fps`;
+
+            // Downgrade: reduce bitrate first, then resolution
+            if (adaptiveBadCount >= ADAPTIVE_BAD_THRESHOLD) {
+                adaptiveBadCount = 0;
+                const newSettings = { ...currentSettings };
+                const currentMbps = newSettings.bit_rate / 1000000;
+
+                if (currentMbps > 2) {
+                    // Reduce bitrate by 30%
+                    newSettings.bit_rate = Math.max(2000000, Math.round(newSettings.bit_rate * 0.7));
+                    autoStatus.textContent = 'Reducing bitrate...';
+                } else {
+                    // Bitrate already low, reduce resolution
+                    const resSteps = [0, 2560, 1920, 1440, 1080, 720, 480];
+                    const curIdx = resSteps.indexOf(newSettings.max_size);
+                    if (curIdx < resSteps.length - 1) {
+                        newSettings.max_size = resSteps[Math.min(curIdx + 1, resSteps.length - 1)];
+                        // Reset bitrate to moderate
+                        newSettings.bit_rate = 8000000;
+                        autoStatus.textContent = 'Reducing resolution...';
+                    }
+                }
+
+                if (newSettings.bit_rate !== currentSettings.bit_rate || newSettings.max_size !== currentSettings.max_size) {
+                    adaptiveReconnecting = true;
+                    applySettingsToUI(newSettings);
+                    reconnectWithSettings(newSettings).finally(() => {
+                        adaptiveReconnecting = false;
+                        adaptiveBadCount = 0;
+                        adaptiveGoodCount = 0;
+                    });
+                }
+            }
+
+            // Upgrade: increase bitrate when stable
+            if (adaptiveGoodCount >= ADAPTIVE_GOOD_THRESHOLD) {
+                adaptiveGoodCount = 0;
+                const newSettings = { ...currentSettings };
+                const currentMbps = newSettings.bit_rate / 1000000;
+
+                if (currentMbps < 20) {
+                    newSettings.bit_rate = Math.min(50000000, Math.round(newSettings.bit_rate * 1.15));
+                    adaptiveReconnecting = true;
+                    applySettingsToUI(newSettings);
+                    autoStatus.textContent = 'Increasing quality...';
+                    reconnectWithSettings(newSettings).finally(() => {
+                        adaptiveReconnecting = false;
+                        adaptiveBadCount = 0;
+                        adaptiveGoodCount = 0;
+                    });
+                }
+            }
+        }, ADAPTIVE_INTERVAL);
+
+        function setQualityIndicator(color, text) {
+            qualityIndicator.className = 'quality-dot ' + color;
+            qualityText.textContent = text;
+        }
+
+        // Debug panel
+        const debugPanel = document.getElementById('debug-panel');
+        const debugStats = document.getElementById('debug-stats');
+        const btnDebug = document.getElementById('btn-debug');
+        debugPanel.style.display = 'none'; // hidden by default now
+
+        btnDebug.addEventListener('click', () => {
+            debugPanel.style.display = debugPanel.style.display === 'none' ? 'block' : 'none';
+        });
+
+        setInterval(() => {
+            // Compute MSE buffer latency
+            let latencyStr = 'N/A';
+            let rateStr = '1.0x';
+            let qualityStr = '';
+            if (usingMSE && videoEl.buffered && videoEl.buffered.length > 0) {
+                const end = videoEl.buffered.end(videoEl.buffered.length - 1);
+                const lat = end - videoEl.currentTime;
+                latencyStr = lat.toFixed(3) + 's';
+                rateStr = videoEl.playbackRate.toFixed(2) + 'x';
+            }
+            if (usingMSE && videoEl.getVideoPlaybackQuality) {
+                const q = videoEl.getVideoPlaybackQuality();
+                qualityStr = `Decoded: ${q.totalVideoFrames} Dropped: ${q.droppedVideoFrames}`;
+            }
+
+            debugStats.textContent = [
+                `Decoder: ${stats.decoderMode}`,
+                `WS: ${stats.wsState}`,
+                `Video pkts: ${stats.videoPkts} (${(stats.videoBytes/1024).toFixed(1)}KB)`,
+                `Audio pkts: ${stats.audioPkts}`,
+                `Codec: ${stats.decoderCodec}`,
+                `State: ${stats.decoderState}`,
+                `Frames: ${stats.decoderFrames}`,
+                `Device: ${deviceWidth}x${deviceHeight}`,
+                `Latency: ${latencyStr}  Rate: ${rateStr}`,
+                `Paused: ${usingMSE ? videoEl.paused : 'n/a'}  ReadyState: ${usingMSE ? videoEl.readyState : 'n/a'}`,
+                `Resets: ${videoDecoder._resetCount || 0}  WaitKey: ${videoDecoder._waitingForKeyframe || false}`,
+                qualityStr,
+                `Control: ${hasControl}`,
+                `Auto: ${autoAdaptive ? 'ON' : 'OFF'}`,
+                stats.lastError ? `ERROR: ${stats.lastError}` : '',
+            ].filter(Boolean).join('\n');
+        }, 500);
+
+        // Initialize: load defaults then connect
+        loadDefaults().then(() => {
+            client.connect();
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,51 @@
+name: Check scrcpy update
+
+on:
+  schedule:
+    # Check daily at 08:00 UTC
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check latest scrcpy version
+        id: check
+        run: |
+          LATEST=$(curl -sL https://api.github.com/repos/Genymobile/scrcpy/releases/latest | grep '"tag_name"' | sed 's/.*"tag_name": "\(.*\)".*/\1/')
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+
+          # Read current tracked version
+          CURRENT=""
+          if [ -f .scrcpy-version ]; then
+            CURRENT=$(cat .scrcpy-version)
+          fi
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+
+          if [ "$LATEST" != "$CURRENT" ]; then
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+            echo "New scrcpy version available: $LATEST (current: $CURRENT)"
+          else
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date: $CURRENT"
+          fi
+
+      - name: Update version file and trigger build
+        if: steps.check.outputs.updated == 'true'
+        run: |
+          LATEST="${{ steps.check.outputs.latest }}"
+          echo "$LATEST" > .scrcpy-version
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .scrcpy-version
+          git commit -m "chore: bump scrcpy to ${LATEST}"
+          git tag "scrcpy-${LATEST}"
+          git push origin HEAD --tags
