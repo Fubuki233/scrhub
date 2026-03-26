@@ -110,7 +110,7 @@ jobs:
           ARCHIVE_NAME="scrhub-${REF_NAME}-${{ matrix.suffix }}"
           cd bundle
           if [ "${{ matrix.archive }}" = "tar.gz" ]; then
-            tar czf "../${ARCHIVE_NAME}.tar.gz" .
+            tar czf "../${ARCHIVE_NAME}.tar.gz" *
             echo "file=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_OUTPUT"
           else
             zip -q "../${ARCHIVE_NAME}.zip" ./*
